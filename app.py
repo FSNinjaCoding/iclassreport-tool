@@ -26,7 +26,7 @@ import pandas as pd
 import streamlit as st
 
 # --- CONFIGURATION ---------------------------------------------------------
-VERSION = "1.4"
+VERSION = "1.4.1"
 
 # Open Gym and Birthdays lead the report; every other taxable program follows
 # (alphabetical), one row each. Taxable vs non-taxable is detected from the
@@ -299,6 +299,54 @@ def report_to_grid(report, period_label):
     return grid
 
 
+def build_xlsx_bytes(report, period_label):
+    """Build the iClassReport as a single-sheet Excel workbook with numeric
+    cells and light formatting. Returns bytes."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+
+    bold = Font(bold=True)
+    money = "#,##0.00"
+
+    wb = Workbook()
+
+    # ---- Sheet 1: iClassReport ----
+    ws = wb.active
+    ws.title = "iClassReport"
+
+    def row(vals, bold_cells=(), money_cells=()):
+        ws.append(vals)
+        r = ws.max_row
+        for c in bold_cells:
+            ws.cell(row=r, column=c).font = bold
+        for c in money_cells:
+            ws.cell(row=r, column=c).number_format = money
+
+    row(["iClassReport", period_label, ""], bold_cells=(1,))
+    row(["Program", "Total Collected (Gross)", "Tax Collected (Portion)"], bold_cells=(1, 2, 3))
+    for name, gross, tax in report["program_rows"]:
+        row([name, gross, tax], money_cells=(2, 3))
+    row(["", "", ""])
+    row(["Refunds", "", ""], bold_cells=(1,))
+    row(["Taxable", report["ref_taxable"], ""], money_cells=(2,))
+    row(["Non-taxable", report["ref_nontaxable"], ""], money_cells=(2,))
+    row(["", "", ""])
+    row(["Card Processing Fees", "", ""], bold_cells=(1,))
+    for k, v in report["fees_section"].items():
+        row([k, v, ""], money_cells=(2,))
+    row(["", "", ""])
+    row(["Use Tax (Gross)", report["use_tax"], ""], money_cells=(2,))
+
+    ws.column_dimensions["A"].width = 28
+    ws.column_dimensions["B"].width = 22
+    ws.column_dimensions["C"].width = 22
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 # =========================================================================== #
 #  UI
 # =========================================================================== #
@@ -439,10 +487,19 @@ if file_a is not None:
                            [f"{k}\t\t{v:,.2f}" for k, v in report["je_credits"]])
         st.code(je_tsv, language=None)
 
-        csv_buf = io.StringIO()
-        csv.writer(csv_buf).writerows(grid)
-        st.download_button("Download iClassReport (CSV)", csv_buf.getvalue(),
-                           file_name=f"iClassReport_{period_label.replace('/', '-')}.csv",
-                           mime="text/csv")
+        try:
+            xlsx_bytes = build_xlsx_bytes(report, period_label)
+            st.download_button(
+                "Download iClassReport (Excel)", xlsx_bytes,
+                file_name=f"iClassReport_{period_label.replace('/', '-')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        except ImportError:
+            st.error("Excel export needs `openpyxl` - add a line saying `openpyxl` to "
+                     "requirements.txt in GitHub. Falling back to CSV:")
+            csv_buf = io.StringIO()
+            csv.writer(csv_buf).writerows(grid)
+            st.download_button("Download iClassReport (CSV)", csv_buf.getvalue(),
+                               file_name=f"iClassReport_{period_label.replace('/', '-')}.csv",
+                               mime="text/csv")
 else:
     st.info("Upload the payout-basis FIN-4 export to begin.")
