@@ -26,7 +26,7 @@ import pandas as pd
 import streamlit as st
 
 # --- CONFIGURATION ---------------------------------------------------------
-VERSION = "1.4.1"
+VERSION = "1.5"
 
 # Open Gym and Birthdays lead the report; every other taxable program follows
 # (alphabetical), one row each. Taxable vs non-taxable is detected from the
@@ -94,6 +94,42 @@ def load_upload(uploaded_file):
             return None
         return rows
     return _read_rows(uploaded_file.read().decode("utf-8-sig", errors="ignore"))
+
+
+def parse_statement_pdf(uploaded_file):
+    """iClassPro merchant statement PDF -> dict with the Summary box numbers,
+    or None if it can't be read."""
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        st.error("Statement upload needs `pypdf` - add a line saying `pypdf==5.4.0` to "
+                 "requirements.txt in GitHub, or enter the numbers manually below.")
+        return None
+    try:
+        uploaded_file.seek(0)
+        text = "\n".join(p.extract_text() or "" for p in PdfReader(io.BytesIO(uploaded_file.read())).pages)
+    except Exception:
+        return None
+
+    def grab(pat):
+        m = re.search(pat, text)
+        return float(m.group(1).replace(",", "")) if m else None
+
+    out = {
+        "total_sales": grab(r"Total Sales\s*\$([\d,]+\.\d{2})"),
+        "refunds": grab(r"Total Refunds\s*\(\$([\d,]+\.\d{2})\)"),
+        "fees": grab(r"Total Processing Fees\s*\(\$([\d,]+\.\d{2})\)"),
+        "net": grab(r"Net Amount Settled\s*\$([\d,]+\.\d{2})"),
+    }
+    if out["refunds"] is None and re.search(r"Total Refunds\s*\$0\.00", text):
+        out["refunds"] = 0.0
+    m = re.search(r"Statement Period:\s*(\d{2}/\d{2}/\d{4})\s*to\s*(\d{2}/\d{2}/\d{4})", text)
+    out["period"] = f"{m.group(1)} - {m.group(2)}" if m else ""
+    if out["total_sales"] is None or out["fees"] is None or out["net"] is None:
+        return None
+    if out["refunds"] is None:
+        out["refunds"] = 0.0
+    return out
 
 
 def detect_report_type(rows):
@@ -280,7 +316,7 @@ def build_iclassreport(progs, unapplied_gw_net, gateway, use_tax=0.0):
     }
 
 
-def report_to_grid(report, period_label):
+def report_to_grid(report, period_label, stmt=None):
     """Flatten the report into the iClassReport layout (one row per taxable program)."""
     grid = [["iClassReport", period_label, ""],
             ["Program", "Total Collected (Gross)", "Tax Collected (Portion)"]]
@@ -296,10 +332,17 @@ def report_to_grid(report, period_label):
         grid.append([k, f"{v:,.2f}", ""])
     grid.append(["", "", ""])
     grid.append(["Use Tax (Gross)", f"{report['use_tax']:,.2f}", ""])
+    if stmt:
+        grid.append(["", "", ""])
+        grid.append(["Merchant Statement Summary", stmt.get("period", ""), ""])
+        grid.append(["Total Sales", f"{stmt['total_sales']:,.2f}", ""])
+        grid.append(["Total Refunds", f"({stmt['refunds']:,.2f})", ""])
+        grid.append(["Total Processing Fees", f"({stmt['fees']:,.2f})", ""])
+        grid.append(["Net Amount Settled", f"{stmt['net']:,.2f}", ""])
     return grid
 
 
-def build_xlsx_bytes(report, period_label):
+def build_xlsx_bytes(report, period_label, stmt=None):
     """Build the iClassReport as a single-sheet Excel workbook with numeric
     cells and light formatting. Returns bytes."""
     from openpyxl import Workbook
@@ -337,6 +380,16 @@ def build_xlsx_bytes(report, period_label):
         row([k, v, ""], money_cells=(2,))
     row(["", "", ""])
     row(["Use Tax (Gross)", report["use_tax"], ""], money_cells=(2,))
+    if stmt:
+        paren = "#,##0.00;(#,##0.00)"
+        row(["", "", ""])
+        row(["Merchant Statement Summary", stmt.get("period", ""), ""], bold_cells=(1,))
+        row(["Total Sales", stmt["total_sales"], ""], money_cells=(2,))
+        row(["Total Refunds", -stmt["refunds"], ""])
+        ws.cell(row=ws.max_row, column=2).number_format = paren
+        row(["Total Processing Fees", -stmt["fees"], ""])
+        ws.cell(row=ws.max_row, column=2).number_format = paren
+        row(["Net Amount Settled", stmt["net"], ""], money_cells=(2,))
 
     ws.column_dimensions["A"].width = 28
     ws.column_dimensions["B"].width = 22
@@ -364,19 +417,43 @@ st.subheader("Step 2 - Upload it")
 file_a = st.file_uploader("FIN-4 Program Deposit Split (CSV or XLSX)", type=["csv", "xlsx"], key="a")
 
 # ---- STEP 3 ----------------------------------------------------------------
-st.subheader("Step 3 - Merchant statement Summary box")
-st.caption("Type the four numbers exactly as the statement's Summary section shows them "
-           "(enter refunds and fees as positive numbers - the parentheses on the statement "
-           "just mean they're subtractions).")
-sc1, sc2, sc3, sc4 = st.columns(4)
-with sc1:
-    stmt_total_sales = st.number_input("Total Sales $", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-with sc2:
-    stmt_refunds = st.number_input("Total Refunds $", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-with sc3:
-    stmt_fees = st.number_input("Total Processing Fees $", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-with sc4:
-    stmt_net = st.number_input("Net Amount Settled $", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+st.subheader("Step 3 - Merchant statement")
+stmt_pdf = st.file_uploader("Upload the iClassPro monthly merchant statement (PDF) - the Summary "
+                            "box is read automatically", type=["pdf"], key="stmt")
+stmt = None
+if stmt_pdf is not None:
+    stmt = parse_statement_pdf(stmt_pdf)
+    if stmt:
+        st.success(f"Statement read ({stmt['period'] or 'period not found'}):  "
+                   f"Total Sales ${stmt['total_sales']:,.2f}  -  Refunds ${stmt['refunds']:,.2f}  -  "
+                   f"Fees ${stmt['fees']:,.2f}  -  Net Settled ${stmt['net']:,.2f}")
+    else:
+        st.error("Couldn't read the Summary box from that PDF - enter the numbers manually below.")
+
+with st.expander("Or enter the Summary box numbers manually",
+                 expanded=(stmt_pdf is not None and stmt is None)):
+    st.caption("Only used when no statement PDF is uploaded (or it can't be read). Enter refunds "
+               "and fees as positive numbers - the parentheses on the statement just mean "
+               "they're subtractions.")
+    sc1, sc2, sc3, sc4 = st.columns(4)
+    with sc1:
+        man_total_sales = st.number_input("Total Sales $", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+    with sc2:
+        man_refunds = st.number_input("Total Refunds $", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+    with sc3:
+        man_fees = st.number_input("Total Processing Fees $", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+    with sc4:
+        man_net = st.number_input("Net Amount Settled $", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+
+if stmt is None and (man_total_sales > 0 or man_refunds > 0 or man_fees > 0 or man_net > 0):
+    stmt = {"total_sales": man_total_sales, "refunds": man_refunds,
+            "fees": man_fees, "net": man_net, "period": ""}
+
+stmt_total_sales = stmt["total_sales"] if stmt else 0.0
+stmt_refunds = stmt["refunds"] if stmt else 0.0
+stmt_fees = stmt["fees"] if stmt else 0.0
+stmt_net = stmt["net"] if stmt else 0.0
+
 use_tax = st.number_input("Use Tax (Gross) $ (optional)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
 
 if file_a is not None:
@@ -410,6 +487,10 @@ if file_a is not None:
 
         st.success(f"Processed period: {period_label} (payout basis)  -  {len(progs)} programs")
 
+        if stmt and stmt.get("period") and period and stmt["period"][:10][:2] != period[:2]:
+            st.warning(f"The statement covers {stmt['period']} but the FIN-4 export covers "
+                       f"{period} - make sure both are for the same month.")
+
         # ---- sanity: payout-basis exports have no cash ----
         if abs(report["cash_collected"]) > 0.005:
             st.warning(f"This export shows ${report['cash_collected']:,.2f} of Cash/Check - a "
@@ -418,7 +499,7 @@ if file_a is not None:
 
         # ---- iClassReport table ----
         st.subheader("iClassReport")
-        grid = report_to_grid(report, period_label)
+        grid = report_to_grid(report, period_label, stmt=stmt)
         df_display = pd.DataFrame(grid[2:], columns=grid[1])
         st.dataframe(df_display, width="stretch", hide_index=True)
 
@@ -488,7 +569,7 @@ if file_a is not None:
         st.code(je_tsv, language=None)
 
         try:
-            xlsx_bytes = build_xlsx_bytes(report, period_label)
+            xlsx_bytes = build_xlsx_bytes(report, period_label, stmt=stmt)
             st.download_button(
                 "Download iClassReport (Excel)", xlsx_bytes,
                 file_name=f"iClassReport_{period_label.replace('/', '-')}.xlsx",
