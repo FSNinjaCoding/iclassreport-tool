@@ -1,38 +1,21 @@
 """
 iClassReport Processor  -  Flip Side Lowell, LLC
 ================================================
-Upload two iClassPro exports and get the canonical iClassReport ST Ledgerwood
-requires, a draft 2090 clearing JE, and a merchant-statement validation.
+Upload the payout-basis FIN-4 export and get the canonical iClassReport
+ST Ledgerwood requires, a draft 2090 clearing JE, and exact validation
+against the merchant statement.
 
-Inputs (CSV exports, run for the SETTLEMENT WINDOW shown in Step 1):
-  A) FIN-4  Program Deposit Split Report
-  B) FIN-24 Gateway Transactions Report
+Input:  FIN-4 Program Deposit Split Report, exported with the saved
+        PAYOUT DATE preset for the calendar month being closed
+        (CSV or XLSX). Payout basis natively matches what the bank
+        received, so no date math and no Gateway (FIN-24) report needed.
 
-v1.3 changes
-  - "Payout date" basis mode (recommended): export FIN-4 with iClassPro's
-    Payout Date option for the plain calendar month - it natively ties to the
-    merchant statement, no settlement-window math needed. Fees are keyed in
-    from the statement (the gateway report cannot filter by payout on this
-    account - Batch Date is unpopulated).
-  - Accepts .xlsx exports as well as .csv (requires openpyxl in
-    requirements.txt)
+Validation: enter the four numbers exactly as they appear in the merchant
+statement's Summary box (Total Sales, Total Refunds, Total Processing
+Fees, Net Amount Settled). Everything must tie to the penny.
 
-v1.2 changes
-  - Step 1 banner computes the settlement window (statement no longer needed
-    to know the export dates; it becomes the validation target instead)
-  - Exact-match validation against the merchant statement (replaces the old
-    "small variance expected" bank cross-check)
-  - Draft JE is tender-filtered: built from gateway-settled tenders only
-    (Credit Card / Swipe / Card Present / eCheck). Cash, Check, External CC,
-    and Nacha are excluded and reported separately so nothing double-counts
-    against direct bank-feed coding (e.g. ClassWallet) or next month's cash
-    deposit.
-  - JE now shows the DR 2090 line and self-checks that debits == credits
-  - Warns if the uploaded reports look like a calendar month instead of the
-    settlement window
-
-Logic validated against June 2026 (ties to the merchant statement, bank, and
-Xero to the penny on settlement basis).  Version 1.2
+Validated against June 2026 (ties to the merchant statement, bank, and
+Xero to the penny).  Version 1.4
 """
 import csv
 import io
@@ -43,7 +26,7 @@ import pandas as pd
 import streamlit as st
 
 # --- CONFIGURATION ---------------------------------------------------------
-VERSION = "1.3.1"
+VERSION = "1.4"
 
 # Open Gym and Birthdays lead the report; every other taxable program follows
 # (alphabetical), one row each. Taxable vs non-taxable is detected from the
@@ -59,78 +42,6 @@ CASH_TENDERS = ["Cash", "Check"]
 EXTERNAL_TENDERS = ["External Credit Card", "Nacha"]
 
 st.set_page_config(page_title=f"iClassReport Processor {VERSION}", page_icon="N", layout="wide")
-
-
-# =========================================================================== #
-#  SETTLEMENT WINDOW  (pure Python - no pandas holiday deps)
-# =========================================================================== #
-def _nth_weekday(year, month, weekday, n):
-    d = datetime.date(year, month, 1)
-    return d + datetime.timedelta(days=(weekday - d.weekday()) % 7 + 7 * (n - 1))
-
-
-def _last_weekday(year, month, weekday):
-    d = (datetime.date(year, 12, 31) if month == 12
-         else datetime.date(year, month + 1, 1) - datetime.timedelta(days=1))
-    return d - datetime.timedelta(days=(d.weekday() - weekday) % 7)
-
-
-def _observed(d):
-    """Federal observance: Saturday holidays observed Friday, Sunday ones Monday."""
-    if d.weekday() == 5:
-        return d - datetime.timedelta(days=1)
-    if d.weekday() == 6:
-        return d + datetime.timedelta(days=1)
-    return d
-
-
-def us_federal_holidays(year):
-    hols = {
-        _observed(datetime.date(year, 1, 1)),        # New Year's Day
-        _nth_weekday(year, 1, 0, 3),                 # MLK Day
-        _nth_weekday(year, 2, 0, 3),                 # Presidents Day
-        _last_weekday(year, 5, 0),                   # Memorial Day
-        _observed(datetime.date(year, 6, 19)),       # Juneteenth
-        _observed(datetime.date(year, 7, 4)),        # Independence Day
-        _nth_weekday(year, 9, 0, 1),                 # Labor Day
-        _nth_weekday(year, 10, 0, 2),                # Columbus Day
-        _observed(datetime.date(year, 11, 11)),      # Veterans Day
-        _nth_weekday(year, 11, 3, 4),                # Thanksgiving
-        _observed(datetime.date(year, 12, 25)),      # Christmas
-    }
-    hols.add(_observed(datetime.date(year + 1, 1, 1)))   # next New Year's can observe Dec 31
-    return hols
-
-
-def _is_bd(d, hols):
-    return d.weekday() < 5 and d not in hols
-
-
-def _roll_fwd(d, hols):
-    while not _is_bd(d, hols):
-        d += datetime.timedelta(days=1)
-    return d
-
-
-def _minus_bd(d, n, hols):
-    while n > 0:
-        d -= datetime.timedelta(days=1)
-        if _is_bd(d, hols):
-            n -= 1
-    return d
-
-
-def settlement_window(year: int, month: int):
-    """iClassPro pays out ~2 business days after the transaction, so the
-    money that lands in the bank during a month comes from this window.
-    Windows tile perfectly: no gaps, no overlaps."""
-    hols = us_federal_holidays(year - 1) | us_federal_holidays(year) | us_federal_holidays(year + 1)
-    first_bd = _roll_fwd(datetime.date(year, month, 1), hols)
-    start = _minus_bd(first_bd, 2, hols)
-    ny, nm = (year + 1, 1) if month == 12 else (year, month + 1)
-    next_first_bd = _roll_fwd(datetime.date(ny, nm, 1), hols)
-    end = _minus_bd(next_first_bd, 2, hols) - datetime.timedelta(days=1)
-    return start, end
 
 
 # =========================================================================== #
@@ -244,6 +155,7 @@ def parse_program_split(rows):
 
     progs = {}
     unapplied_gw_net = 0.0
+    unapplied_gw_refunds = 0.0
     cur = None
     for r in rows[hidx + 1:]:
         if len(r) <= i_cat:
@@ -253,7 +165,10 @@ def parse_program_split(rows):
         if name.lower().startswith("total payments received"):
             break
         if name.lower().startswith("unapplied"):
-            unapplied_gw_net += tender_sum(r, i_gw)
+            amt_gw = tender_sum(r, i_gw)
+            unapplied_gw_net += amt_gw
+            if "refund" in name.lower() and "deleted" not in name.lower():
+                unapplied_gw_refunds += amt_gw
             continue
         if cat == "Program Total:":
             cur = name
@@ -272,77 +187,7 @@ def parse_program_split(rows):
                 progs[cur]["refunds"].append(amt)
             else:
                 progs[cur]["gross"] += amt
-    return progs, round(unapplied_gw_net, 2), period
-
-
-def parse_gateway(rows):
-    """FIN-24 -> dict with gross/fees/net + settled/unsettled splits + period."""
-    hidx = None
-    for i, r in enumerate(rows[:10]):
-        low = [str(c).strip().lower() for c in r]
-        if "amount" in low and "final settlement amount" in low:
-            hidx = i
-            break
-    if hidx is None:
-        hidx = 0
-    header = [c.strip() for c in rows[hidx]]
-
-    def col(name):
-        for i, c in enumerate(header):
-            if c.strip().lower() == name.lower():
-                return i
-        return None
-
-    i_date = col("Date")
-    i_amt = col("Amount")
-    i_fee = col("Fees")
-    i_net = col("Final Settlement Amount")
-    i_status = col("Status")
-
-    gross = fees = net = settled_net = unsettled_amt = 0.0
-    n = unsettled_n = 0
-    dates = []
-    for r in rows[hidx + 1:]:
-        if i_amt is None or len(r) <= i_amt:
-            continue
-        if i_date is not None and (len(r) <= i_date or "/" not in str(r[i_date])):
-            continue  # skip totals row
-        a = parse_money(r[i_amt])
-        f = parse_money(r[i_fee]) if i_fee is not None else 0.0
-        s = parse_money(r[i_net]) if i_net is not None else (a - f)
-        status = (r[i_status].strip().lower() if i_status is not None and len(r) > i_status else "")
-        gross += a
-        fees += f
-        net += s
-        n += 1
-        if i_date is not None:
-            dates.append(str(r[i_date]))
-        if status == "settled":
-            settled_net += s
-        else:
-            unsettled_amt += a
-            unsettled_n += 1
-    period = ""
-    dmin = dmax = None
-    if dates:
-        try:
-            ds = [datetime.datetime.strptime(d, "%m/%d/%Y") for d in dates]
-            dmin, dmax = min(ds).date(), max(ds).date()
-            period = f"{dmin:%m/%d/%Y} - {dmax:%m/%d/%Y}"
-        except Exception:
-            period = ""
-    return {
-        "gross": round(gross, 2),
-        "fees": round(fees, 2),
-        "net": round(net, 2),
-        "count": n,
-        "settled_net": round(settled_net, 2),
-        "unsettled_amt": round(unsettled_amt, 2),
-        "unsettled_count": unsettled_n,
-        "period": period,
-        "date_min": dmin,
-        "date_max": dmax,
-    }
+    return progs, round(unapplied_gw_net, 2), round(unapplied_gw_refunds, 2), period
 
 
 def build_iclassreport(progs, unapplied_gw_net, gateway, use_tax=0.0):
@@ -460,149 +305,68 @@ def report_to_grid(report, period_label):
 st.title("iClassReport Processor")
 st.caption(f"Flip Side Lowell - v{VERSION} - FIN-4 Program Deposit Split + FIN-24 Gateway Transactions to iClassReport")
 
-# ---- STEP 1: basis + which dates to export --------------------------------
-st.subheader("Step 1 - Get the reports")
-basis = st.radio("Report basis",
-                 ["Payout date (recommended)", "Settlement window (transaction date)"],
-                 horizontal=True,
-                 help="Payout date: iClassPro re-buckets each transaction by when it paid out - "
-                      "natively ties to the merchant statement. Settlement window: transaction-date "
-                      "exports for a computed window that approximates the same thing.")
-PAYOUT_MODE = basis.startswith("Payout")
+# ---- STEP 1 ----------------------------------------------------------------
+st.subheader("Step 1 - Export the report")
+st.info("In iClassPro, run the **FIN-4 Program Deposit Split** using your saved **payout-date "
+        "preset** for the calendar month you're closing, and export it (CSV or Excel). "
+        "That's the only file needed - fees come from the merchant statement below.")
 
-today = datetime.date.today()
-prev_year, prev_month = (today.year - 1, 12) if today.month == 1 else (today.year, today.month - 1)
-months = []
-y, m = prev_year, prev_month
-for _ in range(12):
-    months.append((y, m))
-    y, m = (y - 1, 12) if m == 1 else (y, m - 1)
-month_labels = [datetime.date(y, m, 1).strftime("%B %Y") for y, m in months]
-sel = st.selectbox("Month you are closing", month_labels, index=0)
-sel_year, sel_month = months[month_labels.index(sel)]
-win_start, win_end = settlement_window(sel_year, sel_month)
-month_first = datetime.date(sel_year, sel_month, 1)
-month_last = (datetime.date(sel_year + 1, 1, 1) if sel_month == 12
-              else datetime.date(sel_year, sel_month + 1, 1)) - datetime.timedelta(days=1)
+# ---- STEP 2 ----------------------------------------------------------------
+st.subheader("Step 2 - Upload it")
+file_a = st.file_uploader("FIN-4 Program Deposit Split (CSV or XLSX)", type=["csv", "xlsx"], key="a")
 
-if PAYOUT_MODE:
-    st.info(f"**Export the FIN-4 Program Deposit Split for {month_first:%m/%d/%Y} - "
-            f"{month_last:%m/%d/%Y} using iClassPro's PAYOUT DATE option.**  \n"
-            "It natively matches what the bank received this month. The Gateway report cannot "
-            "filter by payout date, so fees come from the merchant statement (Step 3) - or "
-            f"optionally upload a transaction-date FIN-24 for {win_start:%m/%d/%Y} - "
-            f"{win_end:%m/%d/%Y} to get the same fees with per-transaction detail.")
-else:
-    st.info(f"**Export both iClassPro reports for:  {win_start:%m/%d/%Y} - {win_end:%m/%d/%Y}**  \n"
-            f"(FIN-4 Program Deposit Split and FIN-24 Gateway Transactions, Payments-Received basis. "
-            f"This settlement window is what lands in the bank during {sel}, because payouts arrive "
-            f"~2 business days after the transaction.)")
+# ---- STEP 3 ----------------------------------------------------------------
+st.subheader("Step 3 - Merchant statement Summary box")
+st.caption("Type the four numbers exactly as the statement's Summary section shows them "
+           "(enter refunds and fees as positive numbers - the parentheses on the statement "
+           "just mean they're subtractions).")
+sc1, sc2, sc3, sc4 = st.columns(4)
+with sc1:
+    stmt_total_sales = st.number_input("Total Sales $", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+with sc2:
+    stmt_refunds = st.number_input("Total Refunds $", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+with sc3:
+    stmt_fees = st.number_input("Total Processing Fees $", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+with sc4:
+    stmt_net = st.number_input("Net Amount Settled $", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+use_tax = st.number_input("Use Tax (Gross) $ (optional)", min_value=0.0, value=0.0, step=0.01, format="%.2f")
 
-# ---- STEP 2: upload ---------------------------------------------------------
-st.subheader("Step 2 - Upload")
-c1, c2 = st.columns(2)
-with c1:
-    file_a = st.file_uploader("FIN-4 Program Deposit Split (CSV or XLSX)" if PAYOUT_MODE
-                              else "Upload report A (CSV or XLSX)",
-                              type=["csv", "xlsx"], key="a")
-with c2:
-    file_b = st.file_uploader("FIN-24 Gateway Transactions - optional in payout mode" if PAYOUT_MODE
-                              else "Upload report B (CSV or XLSX)",
-                              type=["csv", "xlsx"], key="b")
-
-with st.expander("Step 3 - Merchant statement totals" +
-                 (" (REQUIRED in payout mode if no Gateway file)" if PAYOUT_MODE else " (for exact validation)"),
-                 expanded=PAYOUT_MODE):
-    st.caption("From the iClassPro monthly merchant statement Summary box.")
-    stmt_net_sales = st.number_input("Statement Net Sales (Total Sales - Refunds) $",
-                                     min_value=0.0, value=0.0, step=0.01, format="%.2f")
-    stmt_fees = st.number_input("Statement Total Processing Fees $ (enter as positive)",
-                                min_value=0.0, value=0.0, step=0.01, format="%.2f")
-    stmt_net = st.number_input("Statement Net Amount Settled $",
-                               min_value=0.0, value=0.0, step=0.01, format="%.2f")
-    use_tax = st.number_input("Use Tax (Gross) $", min_value=0.0, value=0.0, step=0.01, format="%.2f")
-
-ready = (file_a is not None and file_b is not None) or \
-        (PAYOUT_MODE and (file_a is not None or file_b is not None))
-
-if ready:
-    program_rows_raw = gateway_rows_raw = None
-    for f in (file_a, file_b):
-        if f is None:
-            continue
-        rows = load_upload(f)
-        if rows is None:
-            st.stop()
-        kind = detect_report_type(rows)
-        if kind == "program_split":
-            program_rows_raw = rows
-        elif kind == "gateway":
-            gateway_rows_raw = rows
-
-    if program_rows_raw is None:
-        st.error("Need a Program Deposit Split (FIN-4) export - could not identify one "
-                 "in the uploaded file(s).")
-    elif gateway_rows_raw is None and not PAYOUT_MODE:
-        st.error("Settlement-window mode needs the Gateway Transactions (FIN-24) export too. "
-                 "Switch to Payout date mode to run without it (fees from the statement).")
-    elif gateway_rows_raw is None and PAYOUT_MODE and stmt_fees <= 0:
-        st.warning("No Gateway file uploaded - enter the statement's Total Processing Fees in "
-                   "Step 3 so the fees section and the 6040 JE line can be built.")
+if file_a is not None:
+    rows = load_upload(file_a)
+    if rows is None:
+        st.stop()
+    kind = detect_report_type(rows)
+    if kind == "gateway":
+        st.error("That's a Gateway Transactions (FIN-24) export - it's no longer used. "
+                 "Upload the FIN-4 Program Deposit Split (payout-date preset) instead.")
+    elif kind != "program_split":
+        st.error("Could not identify this file as a FIN-4 Program Deposit Split export.")
+    elif stmt_fees <= 0:
+        st.warning("Enter the statement's **Total Processing Fees** in Step 3 - the fees section "
+                   "and the 6040 JE line can't be built without it.")
     else:
-        progs, unapplied_gw_net, period = parse_program_split(program_rows_raw)
+        progs, unapplied_gw_net, unapplied_gw_refunds, period = parse_program_split(rows)
         fin4_total = round(sum(v["total"] for v in progs.values()) + unapplied_gw_net, 2)
-
-        if gateway_rows_raw is not None:
-            gateway = parse_gateway(gateway_rows_raw)
-        else:
-            # Payout mode without FIN-24: statement supplies the fees.
-            gateway = {
-                "gross": fin4_total,
-                "fees": round(stmt_fees, 2),
-                "net": round(fin4_total - stmt_fees, 2),
-                "count": 0, "settled_net": round(fin4_total - stmt_fees, 2),
-                "unsettled_amt": 0.0, "unsettled_count": 0,
-                "period": period, "date_min": None, "date_max": None,
-            }
-        if PAYOUT_MODE and gateway_rows_raw is not None:
-            # FIN-24 is transaction-date. Only a settlement-window export carries the
-            # right fees; a calendar-month export does not. Statement fees always win.
-            gateway = dict(gateway)
-            gateway["gross"] = fin4_total
-            if stmt_fees > 0 and abs(gateway["fees"] - stmt_fees) > 0.005:
-                st.warning(f"The uploaded FIN-24 shows fees of ${gateway['fees']:,.2f}, but the "
-                           f"statement says ${stmt_fees:,.2f} - the FIN-24 is probably a "
-                           f"calendar-month export (transaction basis), which covers a different "
-                           f"set of payouts than this month's statement. **Using the statement's "
-                           f"fees.** For matching per-transaction fee detail, export FIN-24 for "
-                           f"{win_start:%m/%d/%Y} - {win_end:%m/%d/%Y} instead.")
-                gateway["fees"] = round(stmt_fees, 2)
-            elif stmt_fees <= 0 and gateway.get("date_min") and gateway["date_min"].day == 1:
-                st.warning("The FIN-24 looks like a calendar-month export - its fees are on "
-                           "transaction basis and will NOT match the statement. Enter the "
-                           "statement's Total Processing Fees in Step 3 to correct this.")
-            gateway["net"] = round(fin4_total - gateway["fees"], 2)
-
+        gateway = {
+            "gross": fin4_total,
+            "fees": round(stmt_fees, 2),
+            "net": round(fin4_total - stmt_fees, 2),
+            "count": 0, "settled_net": round(fin4_total - stmt_fees, 2),
+            "unsettled_amt": 0.0, "unsettled_count": 0,
+            "period": period, "date_min": None, "date_max": None,
+        }
         report = build_iclassreport(progs, unapplied_gw_net, gateway, use_tax=use_tax)
-        period_label = period or gateway["period"] or datetime.date.today().strftime("%m/%d/%Y")
+        period_label = period or datetime.date.today().strftime("%m/%d/%Y")
+        report_refunds = round(report["ref_taxable"] + report["ref_nontaxable"]
+                               - unapplied_gw_refunds, 2)
 
-        src_desc = "FIN-4 payout basis" if PAYOUT_MODE else "settlement window"
-        st.success(f"Processed period: {period_label} ({src_desc})  -  {len(progs)} programs" +
-                   (f"  -  {gateway['count']} gateway transactions" if gateway.get("count") else ""))
+        st.success(f"Processed period: {period_label} (payout basis)  -  {len(progs)} programs")
 
-        # ---- window sanity check (settlement mode only) ----
-        if not PAYOUT_MODE and gateway.get("date_min") and gateway.get("date_max"):
-            if gateway["date_min"] != win_start or gateway["date_max"] != win_end:
-                if gateway["date_min"].day == 1:
-                    st.warning(f"The uploaded reports cover **{gateway['date_min']:%m/%d/%Y} - "
-                               f"{gateway['date_max']:%m/%d/%Y}**, which looks like a calendar month, "
-                               f"not the settlement window **{win_start:%m/%d/%Y} - {win_end:%m/%d/%Y}**. "
-                               "Re-export with the Step 1 dates, or switch to Payout date mode.")
-                else:
-                    st.warning(f"Uploaded report dates ({gateway['date_min']:%m/%d/%Y} - "
-                               f"{gateway['date_max']:%m/%d/%Y}) don't exactly match the Step 1 window "
-                               f"({win_start:%m/%d/%Y} - {win_end:%m/%d/%Y}). Double-check the month "
-                               "selected and the export range.")
+        # ---- sanity: payout-basis exports have no cash ----
+        if abs(report["cash_collected"]) > 0.005:
+            st.warning(f"This export shows ${report['cash_collected']:,.2f} of Cash/Check - a "
+                       "payout-basis export should show $0.00 cash. It was probably run on "
+                       "payments-received basis. Check the preset before sending anything out.")
 
         # ---- iClassReport table ----
         st.subheader("iClassReport")
@@ -612,11 +376,11 @@ if ready:
 
         # ---- statement validation ----
         st.subheader("Merchant statement validation")
-        if stmt_net_sales > 0 or stmt_fees > 0 or stmt_net > 0:
+        if stmt_total_sales > 0 or stmt_refunds > 0 or stmt_net > 0:
             checks = [
-                ("Net Sales", gateway["gross"], stmt_net_sales),
-                ("Processing Fees", gateway["fees"], stmt_fees),
-                ("Net Settled", gateway["net"], stmt_net),
+                ("Total Sales", round(fin4_total + report_refunds, 2), stmt_total_sales),
+                ("Total Refunds", report_refunds, stmt_refunds),
+                ("Net Amount Settled", gateway["net"], stmt_net),
             ]
             all_ok = True
             for label, got, want in checks:
@@ -627,10 +391,10 @@ if ready:
                     st.success(f"{label}: report ${got:,.2f} = statement ${want:,.2f}  (exact match)")
                 else:
                     all_ok = False
-                    st.error(f"{label}: report ${got:,.2f} vs statement ${want:,.2f}  ->  "
-                             f"variance ${var:,.2f}. This should be $0.00. Likely causes: wrong "
-                             "export range/basis, or (settlement mode) a transaction that slipped "
-                             "a batch at the window edge.")
+                    st.error(f"{label}: report ${got:,.2f} vs statement ${want:,.2f}  ->  variance "
+                             f"${var:,.2f}. This should be $0.00. Check that the export used the "
+                             "payout-date preset for the right month, and that the Step 3 numbers "
+                             "were copied from the statement's Summary box.")
             if all_ok:
                 st.success("All statement totals match exactly. Report is good to send and the JE "
                            "is good to post.")
@@ -638,13 +402,12 @@ if ready:
                        "account fee, not a processing fee - it is excluded from this check and does "
                        "not reduce the payouts.")
         else:
-            st.info("Enter the merchant statement totals in Step 3 to validate. These should match "
-                    "to the penny.")
+            st.info("Enter the statement's Summary box numbers in Step 3 to validate. These should "
+                    "match to the penny.")
 
         # ---- draft JE ----
-        st.subheader("Draft 2090 clearing JE (gateway-settled money only)")
-        st.caption("Post in Xero dated the last day of the month. Cash and External CC/Nacha are "
-                   "intentionally excluded - see notes.")
+        st.subheader("Draft 2090 clearing JE")
+        st.caption("Post in Xero dated the last day of the month.")
         je_rows = [(k, f"{v:,.2f}", "") for k, v in report["je_debits"]] + \
                   [(k, "", f"{v:,.2f}") for k, v in report["je_credits"]] + \
                   [("TOTALS", f"{report['je_debit_total']:,.2f}", f"{report['je_credit_total']:,.2f}")]
@@ -653,17 +416,16 @@ if ready:
             st.success("JE balances: debits = credits.")
         else:
             st.error(f"JE DOES NOT BALANCE (DR ${report['je_debit_total']:,.2f} vs "
-                     f"CR ${report['je_credit_total']:,.2f}). Do not post - check the export files "
-                     "and Step 3 fee entry.")
+                     f"CR ${report['je_credit_total']:,.2f}). Do not post - check the export file "
+                     "and the Step 3 fee entry.")
 
         # ---- notes ----
         if report["notes"]:
             st.subheader("Notes / exceptions")
             for note in report["notes"]:
                 st.write("- " + note)
-        if PAYOUT_MODE:
-            st.write("- Payout basis: cash sales never appear on this report (cash has no payout). "
-                     "Capture the cash split when you make the monthly cash deposit.")
+        st.write("- Payout basis: cash sales never appear on this report (cash has no payout). "
+                 "Capture the cash split when you make the monthly cash deposit.")
 
         # ---- export: copy/paste + download ----
         st.subheader("Copy & paste")
@@ -683,4 +445,4 @@ if ready:
                            file_name=f"iClassReport_{period_label.replace('/', '-')}.csv",
                            mime="text/csv")
 else:
-    st.info("Upload the export(s) to begin. Order doesn't matter - the app detects which is which.")
+    st.info("Upload the payout-basis FIN-4 export to begin.")
