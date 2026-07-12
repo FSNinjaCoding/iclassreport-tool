@@ -195,4 +195,167 @@ def parse_gateway(raw_text):
 def build_iclassreport(progs, gateway, use_tax=0.0):
     taxable = [p for p, v in progs.items() if abs(v["tax"]) > 0.001]
     open_gym = [p for p in progs if p.strip().lower() in OPEN_GYM_NAMES]
-    birthdays = [p for p in progs if
+    birthdays = [p for p in progs if p.strip().lower() in BIRTHDAY_NAMES]
+
+    ref_taxable = sum(-x for p in taxable for x in progs[p]["refunds"])
+    ref_nontaxable = sum(-x for p in progs if p not in taxable for x in progs[p]["refunds"])
+
+    # one row per taxable program: Open Gym, Birthdays, then the rest alphabetically
+    ordered = list(open_gym) + list(birthdays) + sorted(
+        p for p in taxable if p not in open_gym and p not in birthdays)
+    program_rows = [(p, round(progs[p]["gross"], 2), round(progs[p]["tax"], 2)) for p in ordered]
+    total_tax = round(sum(progs[p]["tax"] for p in taxable), 2)
+
+    # Draft 2090 clearing JE (net of refunds, ex-tax)
+    retail_progs = [p for p in taxable if p not in open_gym and p not in birthdays]
+    venue = round(sum(progs[p]["total"] - progs[p]["tax"] for p in open_gym + birthdays), 2)
+    merch = round(sum(progs[p]["total"] - progs[p]["tax"] for p in retail_progs), 2)
+    member = round(sum(progs[p]["total"] for p in progs if p not in taxable), 2)
+
+    notes = []
+    extra_taxable = [p for p in taxable if p not in open_gym and p not in birthdays]
+    if extra_taxable:
+        notes.append("Taxable programs beyond Open Gym / Birthdays: " + ", ".join(sorted(extra_taxable)))
+    if gateway.get("unsettled_count"):
+        notes.append(f"{gateway['unsettled_count']} gateway transaction(s) NOT settled "
+                     f"(${gateway['unsettled_amt']:,.2f}) - processed but not completed.")
+
+    return {
+        "program_rows": program_rows,
+        "ref_taxable": round(ref_taxable, 2),
+        "ref_nontaxable": round(ref_nontaxable, 2),
+        "fees_section": {
+            "Total Collected (Gross)": gateway["gross"],
+            "Total Fees": gateway["fees"],
+            "Total Net Deposited": gateway["net"],
+        },
+        "use_tax": round(use_tax, 2),
+        "total_tax": total_tax,
+        "je": {
+            "4200 Sales:Venue (Open Gym + Birthdays)": venue,
+            "4000 Sales:Merchandise (other taxable)": merch,
+            "4100 Sales:Member Fees (non-taxable)": member,
+            "2230 Sales Tax Payable": total_tax,
+            "6040 Credit Card Merchant Fees (DR)": gateway["fees"],
+        },
+        "notes": notes,
+        "taxable_programs": sorted(taxable),
+        "nontaxable_programs": sorted(p for p in progs if p not in taxable),
+    }
+
+
+def report_to_grid(report, period_label):
+    """Flatten the report into the iClassReport layout (one row per taxable program)."""
+    grid = [["iClassReport", period_label, ""],
+            ["Program", "Total Collected (Gross)", "Tax Collected (Portion)"]]
+    for name, gross, tax in report["program_rows"]:
+        grid.append([name, f"{gross:,.2f}", f"{tax:,.2f}"])
+    grid.append(["", "", ""])
+    grid.append(["Refunds", "", ""])
+    grid.append(["Taxable", f"{report['ref_taxable']:,.2f}", ""])
+    grid.append(["Non-taxable", f"{report['ref_nontaxable']:,.2f}", ""])
+    grid.append(["", "", ""])
+    grid.append(["Card Processing Fees", "", ""])
+    for k, v in report["fees_section"].items():
+        grid.append([k, f"{v:,.2f}", ""])
+    grid.append(["", "", ""])
+    grid.append(["Use Tax (Gross)", f"{report['use_tax']:,.2f}", ""])
+    return grid
+
+
+# =========================================================================== #
+#  UI
+# =========================================================================== #
+st.title("iClassReport Processor")
+st.caption(f"Flip Side Lowell - v{VERSION} - FIN-4 Program Deposit Split + FIN-24 Gateway Transactions to iClassReport")
+
+c1, c2 = st.columns(2)
+with c1:
+    file_a = st.file_uploader("Upload report A (CSV)", type=["csv"], key="a")
+with c2:
+    file_b = st.file_uploader("Upload report B (CSV)", type=["csv"], key="b")
+
+with st.expander("Optional inputs"):
+    bank_deposits = st.number_input(
+        "iClassPro card payouts that hit the bank / 2090 this month ($) - for the cross-check",
+        min_value=0.0, value=0.0, step=0.01, format="%.2f")
+    use_tax = st.number_input("Use Tax (Gross) $", min_value=0.0, value=0.0, step=0.01, format="%.2f")
+
+if file_a and file_b:
+    texts = {}
+    for f in (file_a, file_b):
+        f.seek(0)
+        texts[f.name] = f.read().decode("utf-8-sig", errors="ignore")
+
+    program_text = gateway_text = None
+    for name, txt in texts.items():
+        kind = detect_report_type(txt)
+        if kind == "program_split":
+            program_text = txt
+        elif kind == "gateway":
+            gateway_text = txt
+
+    if not program_text or not gateway_text:
+        st.error("Could not identify both files. Need one Program Deposit Split (FIN-4) "
+                 "and one Gateway Transactions (FIN-24) export.")
+    else:
+        progs, period = parse_program_split(program_text)
+        gateway = parse_gateway(gateway_text)
+        report = build_iclassreport(progs, gateway, use_tax=use_tax)
+        period_label = period or gateway["period"] or datetime.date.today().strftime("%m/%d/%Y")
+
+        st.success(f"Processed period: {period_label}  -  {gateway['count']} gateway transactions  -  "
+                   f"{len(progs)} programs")
+
+        # ---- iClassReport table ----
+        st.subheader("iClassReport")
+        grid = report_to_grid(report, period_label)
+        df_display = pd.DataFrame(grid[2:], columns=grid[1])
+        st.dataframe(df_display, use_container_width=True, hide_index=True)
+
+        # ---- cross-check ----
+        st.subheader("Bank cross-check")
+        net = report["fees_section"]["Total Net Deposited"]
+        if bank_deposits > 0:
+            var = round(net - bank_deposits, 2)
+            msg = (f"Net Deposited **${net:,.2f}** vs. bank/2090 card payouts **${bank_deposits:,.2f}** "
+                   f"-> variance **${var:,.2f}**")
+            (st.success if abs(var) < 50 else st.warning)(
+                msg + "  \nA small variance here is expected end-of-month timing "
+                "(late-month transactions that settle next month).")
+        else:
+            st.info(f"Net Deposited (per gateway): **${net:,.2f}**. Enter your bank/2090 card-payout "
+                    "total in *Optional inputs* to see the timing variance.")
+
+        # ---- draft JE ----
+        st.subheader("Draft 2090 clearing JE")
+        st.caption("Report-as-run basis. Revenue allocations post to the accounts below; "
+                   "any small month-end in-transit clears next month.")
+        je_df = pd.DataFrame([(k, f"{v:,.2f}") for k, v in report["je"].items()],
+                             columns=["Account", "Amount"])
+        st.table(je_df)
+
+        # ---- notes ----
+        if report["notes"]:
+            st.subheader("Notes / exceptions")
+            for note in report["notes"]:
+                st.write("- " + note)
+
+        # ---- export: copy/paste + download ----
+        st.subheader("Copy & paste")
+        st.caption("Hover the box and click the copy icon (top-right), then paste into Google Sheets "
+                   "or Excel - it splits into columns automatically.")
+        tsv = "\n".join("\t".join(str(c) for c in row) for row in grid)
+        st.code(tsv, language=None)
+
+        st.caption("Draft 2090 clearing JE:")
+        je_tsv = "\n".join(f"{k}\t{v:,.2f}" for k, v in report["je"].items())
+        st.code(je_tsv, language=None)
+
+        csv_buf = io.StringIO()
+        csv.writer(csv_buf).writerows(grid)
+        st.download_button("Download iClassReport (CSV)", csv_buf.getvalue(),
+                           file_name=f"iClassReport_{period_label.replace('/', '-')}.csv",
+                           mime="text/csv")
+else:
+    st.info("Upload both CSV exports to begin. Order doesn't matter - the app detects which is which.")
