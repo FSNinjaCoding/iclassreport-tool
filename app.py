@@ -26,7 +26,7 @@ import pandas as pd
 import streamlit as st
 
 # --- CONFIGURATION ---------------------------------------------------------
-VERSION = "1.5"
+VERSION = "1.5.1"
 
 # Open Gym and Birthdays lead the report; every other taxable program follows
 # (alphabetical), one row each. Taxable vs non-taxable is detected from the
@@ -328,17 +328,13 @@ def report_to_grid(report, period_label, stmt=None):
     grid.append(["Non-taxable", f"{report['ref_nontaxable']:,.2f}", ""])
     grid.append(["", "", ""])
     grid.append(["Card Processing Fees", "", ""])
+    if stmt:
+        grid.append(["Total Sales", f"{stmt['total_sales']:,.2f}", ""])
+        grid.append(["Total Refunds", f"({stmt['refunds']:,.2f})", ""])
     for k, v in report["fees_section"].items():
         grid.append([k, f"{v:,.2f}", ""])
     grid.append(["", "", ""])
     grid.append(["Use Tax (Gross)", f"{report['use_tax']:,.2f}", ""])
-    if stmt:
-        grid.append(["", "", ""])
-        grid.append(["Merchant Statement Summary", stmt.get("period", ""), ""])
-        grid.append(["Total Sales", f"{stmt['total_sales']:,.2f}", ""])
-        grid.append(["Total Refunds", f"({stmt['refunds']:,.2f})", ""])
-        grid.append(["Total Processing Fees", f"({stmt['fees']:,.2f})", ""])
-        grid.append(["Net Amount Settled", f"{stmt['net']:,.2f}", ""])
     return grid
 
 
@@ -376,20 +372,15 @@ def build_xlsx_bytes(report, period_label, stmt=None):
     row(["Non-taxable", report["ref_nontaxable"], ""], money_cells=(2,))
     row(["", "", ""])
     row(["Card Processing Fees", "", ""], bold_cells=(1,))
+    if stmt:
+        paren = "#,##0.00;(#,##0.00)"
+        row(["Total Sales", stmt["total_sales"], ""], money_cells=(2,))
+        row(["Total Refunds", -stmt["refunds"], ""])
+        ws.cell(row=ws.max_row, column=2).number_format = paren
     for k, v in report["fees_section"].items():
         row([k, v, ""], money_cells=(2,))
     row(["", "", ""])
     row(["Use Tax (Gross)", report["use_tax"], ""], money_cells=(2,))
-    if stmt:
-        paren = "#,##0.00;(#,##0.00)"
-        row(["", "", ""])
-        row(["Merchant Statement Summary", stmt.get("period", ""), ""], bold_cells=(1,))
-        row(["Total Sales", stmt["total_sales"], ""], money_cells=(2,))
-        row(["Total Refunds", -stmt["refunds"], ""])
-        ws.cell(row=ws.max_row, column=2).number_format = paren
-        row(["Total Processing Fees", -stmt["fees"], ""])
-        ws.cell(row=ws.max_row, column=2).number_format = paren
-        row(["Net Amount Settled", stmt["net"], ""], money_cells=(2,))
 
     ws.column_dimensions["A"].width = 28
     ws.column_dimensions["B"].width = 22
